@@ -29,6 +29,7 @@ var rootNameServers = []netip.AddrPort{
 
 func ResolveDomain(ctx context.Context, domain string) ([]*netip.Addr, error) {
 	c := dns.NewClient()
+	//if we dont resolve with one root name server, we try another until we exhaust them all. this is probably unnecessary because they should all be replicated but whatever
 	for _, rootNs := range rootNameServers {
 		slog.Debug("resolving domain from root name server", "domain", domain, "root_server", rootNs.String())
 		addrs, err := resolve(ctx, c, domain, rootNs.String())
@@ -41,53 +42,76 @@ func ResolveDomain(ctx context.Context, domain string) ([]*netip.Addr, error) {
 	return []*netip.Addr{}, nil
 }
 
+//recursively resolve until we find an authoritative response, or a non-authoritative response that we cannot continue from
+//since we only return on authoritative responses (or failures), there shouldn't be a situation where we get a cached response from a non-authoritative source
 func resolve(ctx context.Context, c *dns.Client, domain string, target string) ([]*netip.Addr, error) {
 	ips := []*netip.Addr{}
 	m := dns.NewMsg(domain, dns.TypeA)
 
-	slog.Debug("querying dns server for record", "dns_server", target, "domain", domain)
 	res, _, err := c.Exchange(ctx, m, "udp", target)
 	if err != nil {
-		slog.Debug("error querying dns server", "server", target, "error", err)
 		return nil, err
 	}
 
 	if res.Rcode != 0 {
-		slog.Debug("got error response code from server", "rcode", res.Rcode)
+		slog.Debug("got error code in dns response", "code", res.Rcode)
 		return nil, fmt.Errorf("dns response error code %d", res.Rcode)
 	}
 
 	if !res.Authoritative {
-		slog.Debug("got non-authoritative response from server, querying NS records")
-		m := dns.NewMsg(domain, dns.TypeNS)
-		res, _, err := c.Exchange(ctx, m, "udp", target)
-		if err!=nil {
-			slog.Debug("error querying ns records", "error", err)
-			return nil, fmt.Errorf("NS query error: %w", err)
+		//check for records in authority section
+		if hasAuthoritys(res) {
+			slog.Debug("got non authoritative response with authority section, checking glue records..")
+			authorities := map[string]struct{}{}
+			for _, authority := range res.Ns {
+				if _, ok := authority.(*dns.NS); ok {
+					slog.Debug("found NS record")
+					authorities[authority.Data().String()] = struct{}{}
+				}
+			}
+			if hasExtra(res) {
+				for _, gluerecord := range res.Extra {
+					_, isAuthority := authorities[gluerecord.Header().Name]
+					if isAuthority {
+						slog.Debug("found matching glue record")
+						if _, ok := gluerecord.(*dns.A); ok { 
+							authorityAddr := gluerecord.Data().String()
+							authorityParsedAddr, err := netip.ParseAddr(authorityAddr)
+							if err!=nil {
+								return nil, fmt.Errorf("error parsing authority address to netip addr")
+							}
+							authorityPortAddr := netip.AddrPortFrom(authorityParsedAddr, 53)
+							slog.Debug("querying matching glue record..")
+							return resolve(ctx, c, domain, authorityPortAddr.String())
+						}
+					}
+				}
+			}
+			slog.Debug("no glue records attached with authority records, this is an out-of-bailiwick scenario, bailing. handle this later.")
+			return nil, fmt.Errorf("out-of-bailiwick")
 		}
-		if len(res.Ns) <= 0 {
-			slog.Debug("no answers in response nameserver section", "response", res)
-			return nil, fmt.Errorf("empty authority section")
-		}
-		ns := res.Ns[0].Data().String()
-		m = dns.NewMsg(ns, dns.TypeA)
-		res, _, err = c.Exchange(ctx, m, "udp", target)
-		if err!=nil {
-			slog.Debug("error resolving NS address", "error", err)
-			return nil, fmt.Errorf("NS host resolution error: %w", err)
-		}
-		nsip := res.Answer[0].Data().String()
-		return resolve(ctx, c, domain, nsip)
+		slog.Debug("non-authoritative response and no records in authority section, bailing")
+		return nil, fmt.Errorf("no delegation from non-authoritative nameserver")
 	}
 
-	slog.Debug("got authoritative response")
+	slog.Debug("got authoritative response, parsing records..")
 	for _, rr := range res.Answer {
-		parsedip, err := netip.ParseAddr(rr.Data().String())
-		if err!=nil {
-			slog.Debug("error parsing ip from response string", "response", rr, "error", err)
-			return nil, fmt.Errorf("parsing error: %w", err)
+		if _, ok := rr.(*dns.A); ok {
+			parsedip, err := netip.ParseAddr(rr.Data().String())
+			if err!=nil {
+				slog.Debug("error parsing ip from response string", "response", rr, "error", err)
+				return nil, fmt.Errorf("parsing error: %w", err)
+			}
+			ips = append(ips, &parsedip)
 		}
-		ips = append(ips, &parsedip)
 	}
 	return ips, nil
+}
+
+func hasExtra(m *dns.Msg) bool {
+	return len(m.Extra)>0
+}
+
+func hasAuthoritys(m *dns.Msg) bool {
+	return len(m.Ns)>0
 }

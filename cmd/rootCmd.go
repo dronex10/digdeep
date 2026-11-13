@@ -35,7 +35,7 @@ var (
 				}
 				fmt.Printf("%s:\n", domain)
 				if len(ips) <= 0 {
-					fmt.Printf("no addresses found")
+					fmt.Printf("no addresses found\n")
 				} else {
 					for _, ip := range ips {
 						fmt.Printf("\t%s\n", ip)
